@@ -27,6 +27,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://unnati-636c6.web.app",
+        "https://unnati-636c6.firebaseapp.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.add_middleware(
     CORSMiddleware,
