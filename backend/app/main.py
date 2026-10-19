@@ -28,21 +28,14 @@ app = FastAPI(
 )
 
 from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://unnati-636c6.web.app",
-        "https://unnati-636c6.firebaseapp.com",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=[
+        "https://unnati-eta.vercel.app",
+        "https://unnati-636c6.web.app",
+        "https://unnati-636c6.firebaseapp.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
