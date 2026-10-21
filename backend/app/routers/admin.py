@@ -285,3 +285,96 @@ async def reject_application(
         "status": user.admin_status,
         "reason": user.rejection_reason,
     }
+
+
+async def require_admin_or_owner(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    if not current_user.is_active or (current_user.role != "admin" and not current_user.is_owner):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin or Owner access required",
+        )
+    return current_user
+
+
+class UserStatusUpdateRequest(BaseModel):
+    is_active: bool
+
+
+@router.get("/users")
+async def list_users(
+    user: Annotated[User, Depends(require_admin_or_owner)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    role: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List platform users with optional role filtering and name/phone search."""
+    stmt = select(User).order_by(User.id.desc()).offset(offset).limit(limit)
+
+    if role and role.lower() != "all":
+        stmt = stmt.where(User.role == role.lower())
+
+    if search and search.strip():
+        term = f"%{search.strip().lower()}%"
+        stmt = stmt.where(
+            func.lower(User.name).like(term)
+            | User.phone.like(term)
+            | func.lower(func.coalesce(User.email, "")).like(term)
+        )
+
+    result = await db.execute(stmt)
+    users = result.scalars().all()
+
+    total_stmt = select(func.count(User.id))
+    if role and role.lower() != "all":
+        total_stmt = total_stmt.where(User.role == role.lower())
+    total_count = await db.scalar(total_stmt)
+
+    return {
+        "total": total_count or 0,
+        "users": [
+            {
+                "id": u.id,
+                "name": u.name,
+                "phone": u.phone,
+                "email": u.email,
+                "role": u.role,
+                "is_owner": u.is_owner,
+                "is_active": u.is_active,
+                "preferred_language": u.preferred_language,
+                "child_code": u.child_code,
+                "profile_completed": u.profile_completed,
+                "admin_status": u.admin_status,
+            }
+            for u in users
+        ],
+    }
+
+
+@router.put("/users/{user_id}/status")
+async def update_user_status(
+    user_id: int,
+    request: UserStatusUpdateRequest,
+    admin: Annotated[User, Depends(require_admin_or_owner)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Activate or deactivate a user account."""
+    target_user = await db.scalar(select(User).where(User.id == user_id))
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target_user.is_owner and not admin.is_owner:
+        raise HTTPException(status_code=403, detail="Cannot modify Owner status")
+
+    target_user.is_active = request.is_active
+    await db.commit()
+
+    return {
+        "message": f"User account {'activated' if target_user.is_active else 'deactivated'} successfully",
+        "user_id": target_user.id,
+        "is_active": target_user.is_active,
+    }
+

@@ -18,7 +18,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field, EmailStr
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from app.models.profile import UserProfile
 from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
+    ParentCodeLoginRequest,
     UserResponse,
     TokenResponse,
     LinkChildRequest,
@@ -181,14 +182,8 @@ async def register(
         child_code=child_code,
         is_active=True,
         profile_completed=False,
-        admin_status="not_applicable",
+        admin_status="approved" if data.role == "admin" else "not_applicable",
     )
-
-    if data.role == "admin":
-        raise HTTPException(
-            status_code=400,
-            detail="Use the admin registration endpoint",
-        )
 
     db.add(user)
 
@@ -273,7 +268,13 @@ async def login(
     data: LoginRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    result = await db.execute(select(User).where(User.phone == data.phone))
+    identifier = (data.identifier or data.phone or "").strip()
+    result = await db.execute(
+        select(User).where(
+            (User.phone == identifier)
+            | (func.lower(User.email) == identifier.lower())
+        )
+    )
     user = result.scalar_one_or_none()
 
     if not user or not password_hash.verify(
@@ -281,7 +282,7 @@ async def login(
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect mobile number or password",
+            detail="Incorrect mobile number, email, or password",
         )
 
     if not user.is_active:
@@ -303,6 +304,92 @@ async def login(
     )
 
 
+@router.post("/parent-code-login", response_model=TokenResponse)
+async def parent_code_login(
+    data: ParentCodeLoginRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Direct login for parents using student's Child Code."""
+    code = data.child_code.strip().upper()
+    child = await db.scalar(
+        select(User).where(
+            User.child_code == code,
+            User.role == "student",
+            User.is_active.is_(True),
+        )
+    )
+    if not child:
+        raise HTTPException(
+            status_code=404,
+            detail="Student Child Code not found. Please verify with your child.",
+        )
+
+    parent_phone = data.parent_phone.strip() if data.parent_phone else None
+    if parent_phone and (not parent_phone.isdigit() or len(parent_phone) != 10):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid 10-digit mobile number",
+        )
+
+    parent_user = None
+
+    if parent_phone:
+        parent_user = await db.scalar(
+            select(User).where(User.phone == parent_phone)
+        )
+    else:
+        # Check if parent is already linked to this child
+        link = await db.scalar(
+            select(ParentChildLink).where(ParentChildLink.child_id == child.id)
+        )
+        if link:
+            parent_user = await db.scalar(
+                select(User).where(User.id == link.parent_id, User.is_active.is_(True))
+            )
+
+    if not parent_user:
+        # Create a persistent parent account
+        if not parent_phone:
+            parent_phone = f"98{child.id:08d}"[-10:]
+            while await db.scalar(select(User.id).where(User.phone == parent_phone)):
+                parent_phone = f"9{secrets.randbelow(10**9):09d}"
+
+        parent_name = data.parent_name.strip() if data.parent_name else f"Parent of {child.name}"
+        parent_user = User(
+            name=parent_name,
+            phone=parent_phone,
+            password_hash=password_hash.hash(secrets.token_hex(16)),
+            role="parent",
+            is_owner=False,
+            preferred_language=child.preferred_language or "English",
+            consent_given=True,
+            is_active=True,
+            profile_completed=True,
+            admin_status="not_applicable",
+        )
+        db.add(parent_user)
+        await db.flush()
+
+    # Ensure the parent-child link exists
+    existing_link = await db.scalar(
+        select(ParentChildLink).where(
+            ParentChildLink.parent_id == parent_user.id,
+            ParentChildLink.child_id == child.id,
+        )
+    )
+    if not existing_link:
+        db.add(ParentChildLink(parent_id=parent_user.id, child_id=child.id))
+
+    await db.commit()
+    await db.refresh(parent_user)
+
+    return TokenResponse(
+        access_token=create_access_token(parent_user),
+        token_type="bearer",
+        user=make_user_response(parent_user),
+    )
+
+
 @router.get("/me", response_model=UserResponse)
 async def get_me(
     current_user: Annotated[User, Depends(get_current_user)],
@@ -310,6 +397,7 @@ async def get_me(
     return make_user_response(current_user)
 
 
+@router.post("/profile", response_model=UserResponse)
 @router.put("/profile", response_model=UserResponse)
 async def save_profile(
     data: ProfileUpdateRequest,
@@ -560,3 +648,119 @@ async def my_children(
         }
         for child in children
     ]
+
+
+@router.get("/profile")
+async def get_my_profile(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Retrieve the current user's profile information."""
+    result = await db.execute(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    )
+    profile = result.scalar_one_or_none()
+
+    profile_dict = {}
+    if profile:
+        profile_dict = {
+            c.name: getattr(profile, c.name)
+            for c in profile.__table__.columns
+            if c.name not in ["id", "user_id"]
+        }
+
+    return {
+        "user": make_user_response(current_user).model_dump(mode="json"),
+        "profile": profile_dict,
+    }
+
+
+@router.get("/child-profile/{child_id}")
+async def get_child_profile(
+    child_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Allow a linked parent to view their child's full profile & aspirations."""
+    if current_user.role != "parent":
+        raise HTTPException(
+            status_code=403,
+            detail="Only parents can view child profiles",
+        )
+
+    link = await db.scalar(
+        select(ParentChildLink).where(
+            ParentChildLink.parent_id == current_user.id,
+            ParentChildLink.child_id == child_id,
+        )
+    )
+    if not link:
+        raise HTTPException(
+            status_code=404,
+            detail="Child is not linked to your account",
+        )
+
+    child = await db.scalar(
+        select(User).where(User.id == child_id)
+    )
+    if not child:
+        raise HTTPException(
+            status_code=404,
+            detail="Child user not found",
+        )
+
+    result = await db.execute(
+        select(UserProfile).where(UserProfile.user_id == child_id)
+    )
+    child_profile = result.scalar_one_or_none()
+
+    profile_dict = {}
+    if child_profile:
+        profile_dict = {
+            c.name: getattr(child_profile, c.name)
+            for c in child_profile.__table__.columns
+            if c.name not in ["id", "user_id"]
+        }
+
+    return {
+        "child": {
+            "id": child.id,
+            "name": child.name,
+            "child_code": child.child_code,
+            "profile_completed": child.profile_completed,
+            "preferred_language": child.preferred_language,
+        },
+        "profile": profile_dict,
+    }
+
+
+@router.delete("/unlink-child/{child_id}")
+async def unlink_child(
+    child_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Allow a parent to unlink a child account."""
+    if current_user.role != "parent":
+        raise HTTPException(
+            status_code=403,
+            detail="Only parents can unlink children",
+        )
+
+    result = await db.execute(
+        select(ParentChildLink).where(
+            ParentChildLink.parent_id == current_user.id,
+            ParentChildLink.child_id == child_id,
+        )
+    )
+    link = result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(
+            status_code=404,
+            detail="Linked child record not found",
+        )
+
+    await db.delete(link)
+    await db.commit()
+    return {"message": "Child unlinked successfully"}
+

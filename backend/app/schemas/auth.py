@@ -42,17 +42,23 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    phone: str = Field(min_length=10, max_length=10)
+    identifier: str | None = None
+    phone: str | None = None
     password: str = Field(min_length=1, max_length=128)
 
     @model_validator(mode="after")
-    def validate_phone(self):
-        if not self.phone.isdigit():
-            raise ValueError(
-                "Enter a valid 10-digit mobile number"
-            )
-
+    def validate_login_identifier(self):
+        val = (self.identifier or self.phone or "").strip()
+        if not val:
+            raise ValueError("Enter your mobile number or email address")
+        self.identifier = val
         return self
+
+
+class ParentCodeLoginRequest(BaseModel):
+    child_code: str = Field(min_length=5, max_length=20)
+    parent_phone: str | None = None
+    parent_name: str | None = None
 
 
 class UserResponse(BaseModel):
